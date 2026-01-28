@@ -299,19 +299,41 @@ def setup_cloudfront(session, bucket_name: str, region: str, state: dict, projec
         },
     )
 
-    # Create OAC
+    # Create or find existing OAC
     caller_ref = str(uuid.uuid4())
     oac_name = f"{bucket_name}-oac"
-    print("Creating Origin Access Control...")
-    oac_resp = cf.create_origin_access_control(
-        OriginAccessControlConfig={
-            "Name": oac_name,
-            "OriginAccessControlOriginType": "s3",
-            "SigningBehavior": "always",
-            "SigningProtocol": "sigv4",
-        }
-    )
-    oac_id = oac_resp["OriginAccessControl"]["Id"]
+    oac_id = state.get("cloudfront_oac_id")
+
+    if not oac_id:
+        print("Creating Origin Access Control...")
+        try:
+            oac_resp = cf.create_origin_access_control(
+                OriginAccessControlConfig={
+                    "Name": oac_name,
+                    "OriginAccessControlOriginType": "s3",
+                    "SigningBehavior": "always",
+                    "SigningProtocol": "sigv4",
+                }
+            )
+            oac_id = oac_resp["OriginAccessControl"]["Id"]
+        except cf.exceptions.OriginAccessControlAlreadyExists:
+            print("OAC already exists, looking it up...")
+            paginator = cf.get_paginator("list_origin_access_controls")
+            for page in paginator.paginate():
+                for item in page["OriginAccessControlList"].get("Items", []):
+                    if item["Name"] == oac_name:
+                        oac_id = item["Id"]
+                        break
+                if oac_id:
+                    break
+            if not oac_id:
+                sys.exit(f"OAC '{oac_name}' exists but could not be found in listing.")
+            print(f"Found existing OAC: {oac_id}")
+
+        state["cloudfront_oac_id"] = oac_id
+        save_state(project_dir, state)
+    else:
+        print(f"Using existing OAC: {oac_id}")
 
     s3_origin = f"{bucket_name}.s3.{region}.amazonaws.com"
 
@@ -341,7 +363,6 @@ def setup_cloudfront(session, bucket_name: str, region: str, state: dict, projec
             },
             "CachePolicyId": "658327ea-f89d-4fab-a63d-7e88639e58f6",  # CachingOptimized
             "Compress": True,
-            "ForwardedValues": None,  # not needed with CachePolicyId
         },
         "CustomErrorResponses": {
             "Quantity": 1,
