@@ -594,6 +594,10 @@ def main():
   %(prog)s --bucket my-app --destroy
       Tear down all AWS resources tracked in the state file.
 
+  %(prog)s
+      Redeploy using settings from the existing spa_deploy.json state file.
+      Builds, uploads, and invalidates the CloudFront cache. No flags needed.
+
 state tracking:
   All created resources are recorded in a spa_deploy.json file in the project
   directory. On subsequent deploys, existing resources are reused — only new
@@ -601,8 +605,8 @@ state tracking:
   flag reads this file to determine what to tear down.""",
     )
     parser.add_argument(
-        "--bucket", required=True,
-        help="S3 bucket name. The bucket is created if it does not exist. Used as the origin for CloudFront when --cloudfront is set.",
+        "--bucket",
+        help="S3 bucket name. The bucket is created if it does not exist. Used as the origin for CloudFront when --cloudfront is set. On redeployment, this is read from the state file if not provided.",
     )
     parser.add_argument(
         "--cloudfront", action="store_true",
@@ -634,14 +638,33 @@ state tracking:
     )
     args = parser.parse_args()
 
-    if args.domain and not args.cloudfront:
-        parser.error("--domain requires --cloudfront")
-
     project_dir = os.path.abspath(args.dir)
     if not os.path.isdir(project_dir):
         sys.exit(f"Project directory not found: {project_dir}")
 
     state = load_state(project_dir)
+
+    # Fill in missing args from state file
+    if not args.bucket:
+        if state.get("bucket_name"):
+            args.bucket = state["bucket_name"]
+            print(f"Using bucket from state file: {args.bucket}")
+        else:
+            parser.error("--bucket is required (no existing state file found)")
+
+    if not args.cloudfront and state.get("cloudfront_distribution_id"):
+        args.cloudfront = True
+        print("CloudFront mode enabled (detected from state file)")
+
+    if not args.domain and state.get("domain"):
+        args.domain = state["domain"]
+        print(f"Using domain from state file: {args.domain}")
+
+    if args.region == "us-east-1" and state.get("region"):
+        args.region = state["region"]
+
+    if args.domain and not args.cloudfront:
+        parser.error("--domain requires --cloudfront")
 
     # Destroy mode
     if args.destroy:
