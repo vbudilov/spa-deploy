@@ -4,7 +4,7 @@ A CLI tool that builds and deploys Vite or Yarn SPA projects to AWS S3, with opt
 
 ## What it does
 
-1. **Builds** your project — detects yarn (via `yarn.lock`) or falls back to npm, then runs `npm|yarn run build`
+1. **Builds** your project — detects bun, pnpm, yarn, or npm (checked in that order by lockfile) and runs `<pm> run build`
 2. **Creates an S3 bucket** if it doesn't already exist
 3. **Uploads** all build output files with correct content types and cache headers
 4. **Configures static website hosting** on the bucket (S3-only mode), or
@@ -13,6 +13,8 @@ A CLI tool that builds and deploys Vite or Yarn SPA projects to AWS S3, with opt
 7. **Creates a Route53 A-record alias** pointing your custom domain to the CloudFront distribution
 8. **Tracks all created resources** in a `spa_deploy.json` state file so subsequent deploys skip resource creation and `--destroy` knows what to tear down
 9. **Invalidates the CloudFront cache** automatically on redeployment
+10. **Runs pre-flight checks** automatically before every deploy to catch drift or misconfiguration early
+11. **Discovers existing SPA deployments** in your AWS account so you can import them into state
 
 ## Prerequisites
 
@@ -83,13 +85,27 @@ Custom domain name (e.g. `app.example.com`). Requires `--cloudfront`. When provi
 
 The hosted zone for your domain must already exist in Route53.
 
+#### `--squarespace`
+
+Use external DNS (e.g., Squarespace, GoDaddy, Namecheap) instead of Route53. Requires `--domain` and `--cloudfront`. When enabled:
+
+- The script skips Route53 hosted zone lookup
+- After requesting an ACM certificate, the script pauses and displays the CNAME validation record
+- You manually add the validation record to your DNS provider
+- Press Enter to continue once the record is added
+- The script waits for ACM to validate the certificate (may take 5-10 minutes for DNS propagation)
+- After CloudFront is created, the script displays the CNAME record to point your domain to CloudFront
+- You manually add this CNAME record to your DNS provider
+
+This allows you to use the script with any DNS provider while still automating the AWS resource creation and certificate validation flow.
+
 #### `--region <region>`
 
 AWS region for the S3 bucket (default: `us-east-1`). ACM certificates for CloudFront are always created in `us-east-1` regardless of this setting.
 
 #### `--dir <path>`
 
-Path to the project directory (default: current directory). The script looks for `yarn.lock` here to decide between yarn and npm.
+Path to the project directory (default: current directory). The script looks for `bun.lockb`/`bun.lock`, `pnpm-lock.yaml`, or `yarn.lock` here to select the package manager, falling back to npm.
 
 #### `--output <path>`
 
@@ -98,6 +114,34 @@ Path to the build output directory. If not specified, the script auto-detects by
 #### `--skip-build`
 
 Skip the build step and deploy the existing output directory as-is. Useful for CI pipelines where the build is handled separately, or when redeploying without code changes.
+
+#### `--status`
+
+Print the current deployment state (bucket, CloudFront ID, URL, etc.) read from `spa_deploy.json` and exit. Does not make any AWS calls.
+
+#### `--yes` / `-y`
+
+Skip all interactive confirmation prompts. Useful for CI/CD pipelines where user input is not available.
+
+#### `--profile <name>`
+
+AWS profile name to use from `~/.aws/credentials`. Overrides the default profile resolved by boto3.
+
+#### `--discover`
+
+Scan your AWS account for existing SPA deployments — CloudFront+S3 distributions and S3 static website buckets — and display a numbered summary. No state is read or written.
+
+After listing the deployments, you are prompted to optionally import one into `spa_deploy.json`.
+
+#### `--import N`
+
+Import deployment #N (1-based) from `--discover` into `spa_deploy.json`. Can be combined with `--discover` to skip the interactive prompt:
+
+```
+spa-deploy --discover --import 2
+```
+
+The imported state includes the bucket name, region, CloudFront distribution ID, OAC, ACM certificate ARN (if any), custom domain, and Route53 zone ID (looked up automatically if a domain is present).
 
 #### `--destroy`
 
@@ -132,6 +176,12 @@ Deploy with CloudFront and a custom domain:
 spa-deploy --bucket my-app-prod --cloudfront --domain app.example.com
 ```
 
+Deploy with CloudFront and a custom domain using external DNS (e.g., Squarespace):
+
+```
+spa-deploy --bucket my-app-prod --cloudfront --domain app.example.com --squarespace
+```
+
 Deploy a project in another directory with a specific region:
 
 ```
@@ -155,6 +205,48 @@ Destroy all provisioned resources:
 ```
 spa-deploy --bucket my-app-prod --destroy
 ```
+
+Scan for existing SPA deployments in your AWS account:
+
+```
+spa-deploy --discover
+```
+
+Import a specific discovered deployment into state (no interactive prompt):
+
+```
+spa-deploy --discover --import 1
+```
+
+## Pre-flight checks
+
+Before every deploy (and before destroy), `spa-deploy` automatically validates that all resources referenced in `spa_deploy.json` actually exist and are healthy. Checks run in parallel:
+
+| Check | What is verified |
+|-------|-----------------|
+| `credentials` | AWS credentials are valid; prints the authenticated identity |
+| `s3` | Bucket exists and is accessible |
+| `cloudfront` | Distribution exists, is enabled, status is `Deployed`, OAC is set, domain and aliases match state |
+| `oac` | Origin Access Control still exists |
+| `acm` | Certificate status is `ISSUED`; warns if expiring within 30 days, errors if within 7 days |
+| `route53` | A record for the domain exists in the hosted zone and alias target matches `cloudfront_domain` |
+| `output_dir` | Build output directory is non-empty and contains `index.html` |
+
+Only checks relevant to the current state are run — on a first deploy only credentials and output directory are checked.
+
+Example output:
+
+```
+Pre-flight checks:
+  [ok]   credentials: Authenticated as arn:aws:iam::123456789012:user/vlad
+  [ok]   s3: (no issues)
+  [warn] acm: Certificate expires in 22 days
+  [error] cloudfront: Distribution EXXXXX is disabled
+
+1 error, 1 warning — fix errors before deploying.
+```
+
+Errors halt the deploy. Warnings are printed but do not block.
 
 ## State file
 
