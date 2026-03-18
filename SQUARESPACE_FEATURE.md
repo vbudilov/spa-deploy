@@ -1,18 +1,18 @@
-# Squarespace/External DNS Support
+# External DNS Support (`--externaldns`)
 
 ## Overview
 
-The `--squarespace` flag enables deployment with custom domains using external DNS providers (Squarespace, GoDaddy, Namecheap, etc.) instead of Route53.
+The `--externaldns` flag enables deployment with custom domains using external DNS providers (Squarespace, GoDaddy, Namecheap, etc.) instead of Route53.
 
 ## What Changed
 
 ### 1. New CLI Flag
 
 ```bash
-spa-deploy --bucket my-app --cloudfront --domain app.example.com --squarespace
+spa-deploy --bucket my-app --cloudfront --domain app.example.com --externaldns
 ```
 
-The `--squarespace` flag:
+The `--externaldns` flag:
 - Requires `--domain` and `--cloudfront`
 - Skips Route53 hosted zone lookup
 - Pauses for manual DNS record creation
@@ -39,7 +39,7 @@ The `--squarespace` flag:
 - Prevents false errors for deployments using external DNS
 
 #### `main()`
-- Validates that `--squarespace` requires `--domain`
+- Validates that `--externaldns` requires `--domain`
 - Routes to appropriate certificate request flow based on flag
 - Displays CloudFront CNAME instructions after distribution creation
 - Saves `external_dns: true` to state file
@@ -61,7 +61,7 @@ This field:
 
 ### 4. Documentation Updates
 
-- Added `--squarespace` section to README.md
+- Added `--externaldns` section to README.md
 - Added example usage
 - Updated CLI help text with example
 
@@ -69,24 +69,24 @@ This field:
 
 ### Initial Deployment
 
-1. User runs: `spa-deploy --bucket my-app --cloudfront --domain app.example.com --squarespace`
+1. User runs: `spa-deploy --bucket my-app --cloudfront --domain app.example.com --externaldns`
 2. Script requests ACM certificate
 3. Script displays:
    ```
    ======================================================================
    ACTION REQUIRED: Add the following CNAME record to your DNS provider
    ======================================================================
-   
+
    Record Type: CNAME
    Name:        _abc123.app.example.com
    Value:       _xyz789.acm-validations.aws.
-   
+
    Note: Remove any trailing dots if your DNS provider doesn't support them.
    ======================================================================
-   
+
    Press Enter once you've added the record and it has propagated...
    ```
-4. User adds record to Squarespace DNS
+4. User adds record to their DNS provider
 5. User presses Enter
 6. Script waits for ACM to validate (up to 6 minutes)
 7. Script creates CloudFront distribution
@@ -95,17 +95,17 @@ This field:
    ======================================================================
    ACTION REQUIRED: Add the following CNAME record to your DNS provider
    ======================================================================
-   
+
    Record Type: CNAME
    Name:        app.example.com
    Value:       d1234abcdef.cloudfront.net
-   
+
    Note: Some DNS providers require you to use '@' or leave the name
          blank for the root domain, or just the subdomain part (e.g., 'app')
          if your domain is 'app.example.com'.
    ======================================================================
    ```
-9. User adds CNAME to Squarespace DNS
+9. User adds CNAME to their DNS provider
 10. Deployment complete!
 
 ### Redeployment
@@ -124,11 +124,11 @@ This field:
      - CloudFront distribution: E1A2B3C4D5E6F7
      - ACM certificate: arn:aws:acm:...
      - S3 bucket: my-app (all objects will be deleted)
-   
+
    Note: You'll need to manually remove DNS records for app.example.com from your DNS provider.
    ```
 3. Script deletes AWS resources
-4. User manually removes DNS records from Squarespace
+4. User manually removes DNS records from their DNS provider
 
 ## Benefits
 
@@ -140,7 +140,7 @@ This field:
 
 ## Testing Checklist
 
-- [ ] Deploy with `--squarespace` flag
+- [ ] Deploy with `--externaldns` flag
 - [ ] Verify ACM validation record display
 - [ ] Verify CloudFront CNAME display
 - [ ] Redeploy without flags (should read from state)

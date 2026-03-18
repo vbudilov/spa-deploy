@@ -85,7 +85,7 @@ Custom domain name (e.g. `app.example.com`). Requires `--cloudfront`. When provi
 
 The hosted zone for your domain must already exist in Route53.
 
-#### `--squarespace`
+#### `--externaldns`
 
 Use external DNS (e.g., Squarespace, GoDaddy, Namecheap) instead of Route53. Requires `--domain` and `--cloudfront`. When enabled:
 
@@ -179,7 +179,7 @@ spa-deploy --bucket my-app-prod --cloudfront --domain app.example.com
 Deploy with CloudFront and a custom domain using external DNS (e.g., Squarespace):
 
 ```
-spa-deploy --bucket my-app-prod --cloudfront --domain app.example.com --squarespace
+spa-deploy --bucket my-app-prod --cloudfront --domain app.example.com --externaldns
 ```
 
 Deploy a project in another directory with a specific region:

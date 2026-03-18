@@ -49,6 +49,16 @@ def detect_package_manager(project_dir: str) -> str:
 
 def run_build(project_dir: str):
     pm = detect_package_manager(project_dir)
+
+    # Auto-install dependencies if node_modules is missing
+    node_modules = os.path.join(project_dir, "node_modules")
+    if not os.path.isdir(node_modules):
+        install_cmd = [pm, "install"]
+        print(f"node_modules not found — running: {' '.join(install_cmd)}")
+        result = subprocess.run(install_cmd, cwd=project_dir)
+        if result.returncode != 0:
+            sys.exit(f"Install failed with exit code {result.returncode}")
+
     cmd = [pm, "run", "build"]
     print(f"Running: {' '.join(cmd)}")
     result = subprocess.run(cmd, cwd=project_dir)
@@ -57,10 +67,17 @@ def run_build(project_dir: str):
 
 
 def detect_output_dir(project_dir: str) -> str:
-    for candidate in ["dist", "build"]:
+    for candidate in ["dist", "build", "out"]:
         p = os.path.join(project_dir, candidate)
         if os.path.isdir(p):
             return p
+    # Next.js without static export: .next directory exists but no out/
+    next_dir = os.path.join(project_dir, ".next")
+    if os.path.isdir(next_dir):
+        sys.exit(
+            "Detected a Next.js build (.next/) but no static export directory (out/).\n"
+            "For S3 deployment, add `output: 'export'` to your next.config.js and rebuild."
+        )
     sys.exit("Could not detect build output directory. Use --output to specify it.")
 
 
@@ -862,6 +879,213 @@ def print_preflight_results(issues: list) -> bool:
     return errors == 0
 
 
+def fix_preflight_issues(session, state: dict, project_dir: str, issues: list, yes: bool = False):
+    """Fix pre-flight errors: expired/invalid ACM certs and missing OAC on CloudFront."""
+    acm_errors = [i for i in issues if i["resource"] == "acm" and i["level"] == "error"]
+    oac_warnings = [i for i in issues if i["resource"] == "cloudfront"
+                    and "no OAC configured" in i.get("message", "")]
+
+    if not acm_errors and not oac_warnings:
+        print("No fixable issues found.")
+        return
+
+    print("\nFixable issues detected:")
+    for i, issue in enumerate(acm_errors + oac_warnings, 1):
+        print(f"  {i}. [{issue['level']}] {issue['resource']}: {issue['message']}")
+
+    if not yes:
+        answer = input("\nFix these issues? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("Skipping fixes.")
+            return
+
+    cf = session.client("cloudfront")
+    acm = session.client("acm", region_name="us-east-1")
+    dist_id = state.get("cloudfront_distribution_id")
+
+    # --- Fix expired/invalid ACM certificate ---
+    if acm_errors:
+        old_cert_arn = state.get("acm_certificate_arn")
+        domain = state.get("domain")
+
+        if not domain:
+            print("Cannot fix certificate: no domain in state file.")
+            return
+
+        # Request new certificate first (before deleting old one)
+        print(f"\nRequesting new ACM certificate for {domain}...")
+        cert_resp = acm.request_certificate(DomainName=domain, ValidationMethod="DNS")
+        new_cert_arn = cert_resp["CertificateArn"]
+        print(f"New certificate ARN: {new_cert_arn}")
+
+        # Wait for validation details
+        print("Waiting for DNS validation details...")
+        validation_record = None
+        for _ in range(30):
+            time.sleep(2)
+            resp = acm.describe_certificate(CertificateArn=new_cert_arn)
+            options = resp["Certificate"].get("DomainValidationOptions", [])
+            if options and "ResourceRecord" in options[0]:
+                validation_record = options[0]["ResourceRecord"]
+                break
+
+        if not validation_record:
+            sys.exit("Timed out waiting for ACM validation details.")
+
+        external_dns = state.get("external_dns", False)
+        if external_dns:
+            print("\n" + "="*70)
+            print("ACTION REQUIRED: Add the following CNAME record to your DNS provider")
+            print("="*70)
+            print(f"\nRecord Type: {validation_record['Type']}")
+            print(f"Name:        {validation_record['Name']}")
+            print(f"Value:       {validation_record['Value']}")
+            print("\nNote: Remove any trailing dots if your DNS provider doesn't support them.")
+            print("="*70)
+            input("\nPress Enter once you've added the record and it has propagated...")
+            print()
+        else:
+            zone_id = state.get("route53_zone_id")
+            if not zone_id:
+                print("Cannot auto-validate: no route53_zone_id in state. Add DNS record manually:")
+                print(f"  {validation_record['Type']}  {validation_record['Name']}  {validation_record['Value']}")
+                input("\nPress Enter once you've added the record and it has propagated...")
+            else:
+                route53 = session.client("route53")
+                print(f"Creating validation record: {validation_record['Name']} -> {validation_record['Value']}")
+                route53.change_resource_record_sets(
+                    HostedZoneId=zone_id,
+                    ChangeBatch={
+                        "Changes": [{
+                            "Action": "UPSERT",
+                            "ResourceRecordSet": {
+                                "Name": validation_record["Name"],
+                                "Type": validation_record["Type"],
+                                "TTL": 300,
+                                "ResourceRecords": [{"Value": validation_record["Value"]}],
+                            },
+                        }]
+                    },
+                )
+
+        # Wait for new cert to be issued
+        print("Waiting for certificate validation (this may take a few minutes)...")
+        for i in range(180):
+            time.sleep(2)
+            resp = acm.describe_certificate(CertificateArn=new_cert_arn)
+            status = resp["Certificate"]["Status"]
+            if status == "ISSUED":
+                print("New certificate issued!")
+                break
+            if status == "FAILED":
+                sys.exit(f"Certificate validation failed: {resp['Certificate'].get('FailureReason')}")
+            if i % 15 == 0 and i > 0:
+                print(f"  Still waiting... (status: {status})")
+        else:
+            sys.exit("Timed out waiting for certificate to be issued.")
+
+        # Update CloudFront distribution to use the new certificate
+        if dist_id:
+            print(f"Updating CloudFront distribution {dist_id} with new certificate...")
+            resp = cf.get_distribution_config(Id=dist_id)
+            etag = resp["ETag"]
+            dist_config = resp["DistributionConfig"]
+            dist_config["ViewerCertificate"] = {
+                "ACMCertificateArn": new_cert_arn,
+                "SSLSupportMethod": "sni-only",
+                "MinimumProtocolVersion": "TLSv1.2_2021",
+            }
+            cf.update_distribution(Id=dist_id, DistributionConfig=dist_config, IfMatch=etag)
+            print("CloudFront distribution updated with new certificate.")
+
+        # Delete the old expired certificate
+        if old_cert_arn and old_cert_arn != new_cert_arn:
+            print(f"Deleting expired certificate {old_cert_arn}...")
+            try:
+                acm.delete_certificate(CertificateArn=old_cert_arn)
+                print("  Deleted.")
+            except ClientError as e:
+                print(f"  Warning: could not delete old certificate: {e}")
+
+        # Update state
+        state["acm_certificate_arn"] = new_cert_arn
+        save_state(project_dir, state)
+
+    # --- Fix missing OAC on CloudFront ---
+    if oac_warnings and dist_id:
+        bucket_name = state.get("bucket_name")
+        if not bucket_name:
+            print("Cannot fix OAC: no bucket_name in state file.")
+            return
+
+        oac_name = f"{bucket_name}-oac"
+        oac_id = state.get("cloudfront_oac_id")
+
+        if not oac_id:
+            print(f"\nCreating Origin Access Control '{oac_name}'...")
+            try:
+                oac_resp = cf.create_origin_access_control(
+                    OriginAccessControlConfig={
+                        "Name": oac_name,
+                        "OriginAccessControlOriginType": "s3",
+                        "SigningBehavior": "always",
+                        "SigningProtocol": "sigv4",
+                    }
+                )
+                oac_id = oac_resp["OriginAccessControl"]["Id"]
+            except cf.exceptions.OriginAccessControlAlreadyExists:
+                print("OAC already exists, looking it up...")
+                paginator = cf.get_paginator("list_origin_access_controls")
+                for page in paginator.paginate():
+                    for item in page["OriginAccessControlList"].get("Items", []):
+                        if item["Name"] == oac_name:
+                            oac_id = item["Id"]
+                            break
+                    if oac_id:
+                        break
+                if not oac_id:
+                    sys.exit(f"OAC '{oac_name}' exists but could not be found in listing.")
+            state["cloudfront_oac_id"] = oac_id
+            save_state(project_dir, state)
+
+        print(f"Attaching OAC {oac_id} to CloudFront distribution {dist_id}...")
+        resp = cf.get_distribution_config(Id=dist_id)
+        etag = resp["ETag"]
+        dist_config = resp["DistributionConfig"]
+
+        origins = dist_config.get("Origins", {}).get("Items", [])
+        for origin in origins:
+            if ".s3." in origin.get("DomainName", ""):
+                origin["OriginAccessControlId"] = oac_id
+                # Clear legacy OAI if present
+                if "S3OriginConfig" in origin:
+                    origin["S3OriginConfig"]["OriginAccessIdentity"] = ""
+
+        cf.update_distribution(Id=dist_id, DistributionConfig=dist_config, IfMatch=etag)
+        print("CloudFront distribution updated with OAC.")
+
+        # Ensure bucket policy allows CloudFront
+        region = state.get("region", "us-east-1")
+        s3 = session.client("s3", region_name=region)
+        dist_resp = cf.get_distribution(Id=dist_id)
+        dist_arn = dist_resp["Distribution"]["ARN"]
+        policy = json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Sid": "AllowCloudFrontServicePrincipal",
+                "Effect": "Allow",
+                "Principal": {"Service": "cloudfront.amazonaws.com"},
+                "Action": "s3:GetObject",
+                "Resource": f"arn:aws:s3:::{bucket_name}/*",
+                "Condition": {"StringEquals": {"AWS:SourceArn": dist_arn}},
+            }],
+        })
+        s3.put_bucket_policy(Bucket=bucket_name, Policy=policy)
+        print("S3 bucket policy updated for CloudFront OAC access.")
+
+    print("\nAll fixable issues resolved. Re-run deploy to continue.")
+
+
 def discover_deployments(session) -> list:
     """Scan the AWS account for existing SPA deployments."""
     deployments = []
@@ -1024,8 +1248,8 @@ def main():
       Deploy with CloudFront, provision an ACM TLS certificate for the domain,
       and create a Route53 alias record pointing to the distribution.
 
-  %(prog)s --bucket my-app --cloudfront --domain app.example.com --squarespace
-      Deploy with CloudFront and custom domain using external DNS (e.g., Squarespace).
+  %(prog)s --bucket my-app --cloudfront --domain app.example.com --externaldns
+      Deploy with CloudFront and custom domain using external DNS (e.g., Squarespace, GoDaddy).
       The script will pause and display DNS records for you to add manually.
 
   %(prog)s --bucket my-app --skip-build --output ./dist
@@ -1057,8 +1281,8 @@ state tracking:
         help="Custom domain name (e.g. app.example.com). Requires --cloudfront. The script will: (1) find the matching Route53 hosted zone, (2) request a DNS-validated ACM certificate in us-east-1, (3) create the validation CNAME in Route53 and wait for issuance, (4) attach the certificate to the CloudFront distribution, and (5) create a Route53 A-record alias pointing the domain to CloudFront. The hosted zone must already exist in Route53.",
     )
     parser.add_argument(
-        "--squarespace", action="store_true",
-        help="Use external DNS (e.g., Squarespace) instead of Route53. When combined with --domain, the script will pause and display DNS records for you to add manually. Skips Route53 hosted zone lookup and alias record creation.",
+        "--externaldns", action="store_true",
+        help="Use external DNS (e.g., Squarespace, GoDaddy, Namecheap) instead of Route53. When combined with --domain, the script will pause and display DNS records for you to add manually. Skips Route53 hosted zone lookup and alias record creation.",
     )
     parser.add_argument(
         "--region", default="us-east-1",
@@ -1083,6 +1307,10 @@ state tracking:
     parser.add_argument(
         "--status", action="store_true",
         help="Print the current deployment state from spa_deploy.json and exit.",
+    )
+    parser.add_argument(
+        "--fix", action="store_true",
+        help="Fix pre-flight errors: renew expired ACM certificates (deletes old cert, requests new one, updates CloudFront) and attach missing OAC to CloudFront distributions.",
     )
     parser.add_argument(
         "--yes", "-y", action="store_true",
@@ -1110,6 +1338,14 @@ state tracking:
 
     if args.status:
         print_status(state)
+        return
+
+    if args.fix:
+        session = boto3.Session(region_name=args.region, profile_name=args.profile or None)
+        print("\nRunning pre-flight checks...")
+        issues = preflight_check(session, state)
+        print_preflight_results(issues)
+        fix_preflight_issues(session, state, project_dir, issues, yes=args.yes)
         return
 
     if args.discover or args.import_index is not None:
@@ -1155,8 +1391,8 @@ state tracking:
     if args.domain and not args.cloudfront:
         parser.error("--domain requires --cloudfront")
     
-    if args.squarespace and not args.domain:
-        parser.error("--squarespace requires --domain")
+    if args.externaldns and not args.domain:
+        parser.error("--externaldns requires --domain")
 
     session = boto3.Session(region_name=args.region, profile_name=args.profile or None)
 
@@ -1218,7 +1454,7 @@ state tracking:
             if confirmed:
                 # Handle domain + ACM + Route53 if requested
                 if args.domain:
-                    if args.squarespace:
+                    if args.externaldns:
                         # External DNS mode - no Route53 operations
                         request_acm_certificate(session, args.domain, None, None, state, project_dir, external_dns=True)
                         state["external_dns"] = True
@@ -1233,10 +1469,10 @@ state tracking:
                 setup_cloudfront(session, args.bucket, args.region, state, project_dir, domain=args.domain)
 
                 # Create Route53 alias after distribution is created (only if not using external DNS)
-                if args.domain and not args.squarespace:
+                if args.domain and not args.externaldns:
                     state = load_state(project_dir)
                     create_domain_alias(route53, zone_id, args.domain, state["cloudfront_domain"], state, project_dir)
-                elif args.domain and args.squarespace:
+                elif args.domain and args.externaldns:
                     # Display instructions for creating CNAME to CloudFront
                     state = load_state(project_dir)
                     print("\n" + "="*70)
